@@ -1,11 +1,14 @@
 package rest
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/domains/device"
+	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/utils"
 	"github.com/gofiber/fiber/v3"
 )
@@ -30,6 +33,7 @@ func InitRestDevice(app fiber.Router, service device.IDeviceUsecase) Device {
 	app.Get("/devices/:device_id/status", rest.Status)
 	app.Patch("/devices/:device_id/webhook", rest.UpdateDeviceWebhook)
 	app.Get("/devices/:device_id/webhook", rest.GetDeviceWebhook)
+	app.Put("/devices/:device_id/proxy", rest.SetDeviceProxy)
 
 	return rest
 }
@@ -290,5 +294,34 @@ func (handler *Device) GetDeviceWebhook(c fiber.Ctx) error {
 				return false
 			}(),
 		},
+	})
+}
+
+// SetDeviceProxy sets or clears (proxy_url null or empty) the outbound proxy of one
+// device and reconnects it through the new route. The URL is never echoed back: it
+// usually carries the proxy password.
+func (handler *Device) SetDeviceProxy(c fiber.Ctx) error {
+	deviceID := pathDeviceID(c)
+	var req struct {
+		ProxyURL *string `json:"proxy_url"`
+	}
+	if err := c.Bind().Body(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(utils.ResponseData{Status: 400, Code: "BAD_REQUEST", Message: "Invalid request body"})
+	}
+
+	err := whatsapp.GetDeviceManager().SetDeviceProxy(deviceID, req.ProxyURL)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return c.Status(fiber.StatusNotFound).JSON(utils.ResponseData{Status: 404, Code: "DEVICE_NOT_FOUND", Message: fmt.Sprintf("device %s not found", deviceID)})
+	case errors.Is(err, whatsapp.ErrProxyNotSupported):
+		return c.Status(fiber.StatusNotImplemented).JSON(utils.ResponseData{Status: 501, Code: "NOT_SUPPORTED", Message: err.Error()})
+	}
+	utils.PanicIfNeeded(err)
+
+	return c.JSON(utils.ResponseData{
+		Status:  200,
+		Code:    "SUCCESS",
+		Message: "Device proxy updated",
+		Results: map[string]any{"device_id": deviceID, "proxy_set": req.ProxyURL != nil && *req.ProxyURL != ""},
 	})
 }

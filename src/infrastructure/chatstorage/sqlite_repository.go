@@ -2096,6 +2096,42 @@ func (r *SQLiteRepository) GetDeviceWebhookConfig(deviceID string) (*domainChatS
 	return &config, nil
 }
 
+// SetDeviceProxy sets (or, with nil, clears) the outbound proxy of one device.
+// Returns sql.ErrNoRows if the device does not exist.
+func (r *SQLiteRepository) SetDeviceProxy(deviceID string, proxyURL *string) error {
+	if strings.TrimSpace(deviceID) == "" {
+		return fmt.Errorf("device id is required")
+	}
+	if proxyURL != nil && strings.TrimSpace(*proxyURL) == "" {
+		proxyURL = nil
+	}
+	result, err := r.db.Exec(`UPDATE devices SET proxy_url = ?, updated_at = ? WHERE device_id = ?`, proxyURL, time.Now(), deviceID)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// GetDeviceProxy returns the outbound proxy of one device, or nil when it has none.
+func (r *SQLiteRepository) GetDeviceProxy(deviceID string) (*string, error) {
+	var proxyURL sql.NullString
+	err := r.db.QueryRow(`SELECT proxy_url FROM devices WHERE device_id = ? LIMIT 1`, deviceID).Scan(&proxyURL)
+	if err == sql.ErrNoRows || (err == nil && (!proxyURL.Valid || proxyURL.String == "")) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &proxyURL.String, nil
+}
+
 // GetChatNameWithPushName determines the appropriate name for a chat with pushname support
 func (r *SQLiteRepository) GetChatNameWithPushName(jid types.JID, chatJID string, senderUser string, pushName string) string {
 	// First, check if chat already exists with a name
@@ -3167,5 +3203,8 @@ func (r *SQLiteRepository) getMigrations() []string {
 
 		// Migration 49: Persist reply context for live, sent, and history messages.
 		`ALTER TABLE messages ADD COLUMN context_metadata TEXT DEFAULT ''`,
+
+		// Migration 50: Per-device outbound proxy (overrides WHATSAPP_PROXY for that device)
+		`ALTER TABLE devices ADD COLUMN proxy_url TEXT DEFAULT NULL`,
 	}
 }

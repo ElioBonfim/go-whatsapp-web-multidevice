@@ -146,3 +146,11 @@ type IChatStorageRepository interface {
 	// Schema operations
 	InitializeSchema() error
 }
+
+// IDeviceProxyStore persists a per-device outbound proxy. Separate from
+// IChatStorageRepository so storages that predate it keep compiling; the device
+// manager checks for it with a type assertion.
+type IDeviceProxyStore interface {
+	SetDeviceProxy(deviceID string, proxyURL *string) error
+	GetDeviceProxy(deviceID string) (*string, error)
+}

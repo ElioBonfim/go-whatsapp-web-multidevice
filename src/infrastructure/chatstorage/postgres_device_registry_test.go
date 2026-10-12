@@ -127,3 +127,52 @@ func TestRegistryBehavesLikeTheSQLiteOne(t *testing.T) {
 		t.Fatalf("deleted record still there: %+v (err %v)", rec, err)
 	}
 }
+
+func TestRegistryKeepsAProxyPerDevice(t *testing.T) {
+	registry, base := registryForTest(t)
+	if err := registry.SaveDeviceRecord(&domainChatStorage.DeviceRecord{DeviceID: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	proxy := "http://user:pass@proxy.example:3128"
+	if err := registry.SetDeviceProxy("a", &proxy); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := registry.GetDeviceProxy("a"); err != nil || got == nil || *got != proxy {
+		t.Fatalf("proxy = %v (err %v)", got, err)
+	}
+	empty := ""
+	if err := registry.SetDeviceProxy("a", &empty); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := registry.GetDeviceProxy("a"); got != nil {
+		t.Fatalf("empty proxy should clear it, got %v", *got)
+	}
+	if err := registry.SetDeviceProxy("ninguem", &proxy); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("unknown device: got %v, want sql.ErrNoRows", err)
+	}
+
+	// SQLite keeps it too, and ImportRecords brings it along with the webhook.
+	if err := base.SaveDeviceRecord(&domainChatStorage.DeviceRecord{DeviceID: "b", DisplayName: "Por proxy"}); err != nil {
+		t.Fatal(err)
+	}
+	hook := "http://app/hook"
+	if err := base.SetDeviceWebhookConfig("b", &domainChatStorage.DeviceWebhookConfig{WebhookURL: &hook}); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.(domainChatStorage.IDeviceProxyStore).SetDeviceProxy("b", &proxy); err != nil {
+		t.Fatal(err)
+	}
+	records, _ := base.ListDeviceRecords()
+	if n, err := registry.ImportRecords(base, records); err != nil || n != 1 {
+		t.Fatalf("imported %d (err %v)", n, err)
+	}
+	if got, _ := registry.GetDeviceProxy("b"); got == nil || *got != proxy {
+		t.Fatal("proxy not imported")
+	}
+	if cfg, _ := registry.GetDeviceWebhookConfig("b"); cfg == nil || cfg.WebhookURL == nil || *cfg.WebhookURL != hook {
+		t.Fatal("webhook not imported")
+	}
+	if _, err := registry.ImportRecords(base, records); err == nil {
+		t.Fatal("importing an id that already exists must be refused")
+	}
+}

@@ -161,3 +161,69 @@ func TestMigrateSkipsWhenPostgresAlreadyHasSessions(t *testing.T) {
 		t.Fatal("legacy file must stay where it was")
 	}
 }
+
+// A second GOWA's store (another proxy) joins a Postgres store that already has sessions.
+func TestImportSQLiteSessionsAddsAnotherStore(t *testing.T) {
+	ctx := context.Background()
+	pg := testPostgres(t)
+	log := waLog.Noop
+
+	target := sqlstore.NewWithDB(pg, "postgres", log)
+	if err := target.Upgrade(ctx); err != nil {
+		t.Fatal(err)
+	}
+	conta := func(c *sqlstore.Container, user string) {
+		device := c.NewDevice()
+		jid := types.NewJID(user, types.DefaultUserServer)
+		device.ID = &jid
+		device.Account = &waAdv.ADVSignedDeviceIdentity{
+			Details: []byte("d"), AccountSignature: random.Bytes(64), AccountSignatureKey: random.Bytes(32), DeviceSignature: random.Bytes(64),
+		}
+		if err := c.PutDevice(ctx, device); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conta(target, "5511900000001")
+
+	other := filepath.Join(t.TempDir(), "whatsapp.db")
+	source, err := sqlstore.New(ctx, sqlite.DriverName, sqlite.FormatChatStorageURI("file:"+other, true, true), log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conta(source, "5511900000002")
+	_ = source.Close()
+
+	moved, err := ImportSQLiteSessions(ctx, other, pg, log)
+	if err != nil || moved != 1 {
+		t.Fatalf("imported %d (err %v), want 1", moved, err)
+	}
+	all, _ := target.GetAllDevices(ctx)
+	if len(all) != 2 {
+		t.Fatalf("got %d devices, want 2", len(all))
+	}
+
+	// The same session can never be loaded twice.
+	again := filepath.Join(t.TempDir(), "whatsapp.db")
+	dup, err := sqlstore.New(ctx, sqlite.DriverName, sqlite.FormatChatStorageURI("file:"+again, true, true), log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conta(dup, "5511900000001")
+	_ = dup.Close()
+	if _, err := ImportSQLiteSessions(ctx, again, pg, log); err == nil {
+		t.Fatal("a device already in postgres must be refused")
+	}
+}
+
+func TestValidateProxyURL(t *testing.T) {
+	for _, ok := range []string{"http://user:pass@host:3128", "https://host:443", "socks5://host:1080"} {
+		if err := ValidateProxyURL(ok); err != nil {
+			t.Fatalf("%s refused: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "host:3128", "ftp://host", "http://"} {
+		if err := ValidateProxyURL(bad); err == nil {
+			t.Fatalf("%q accepted", bad)
+		}
+	}
+}

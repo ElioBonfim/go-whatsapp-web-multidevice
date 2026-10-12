@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS gowa_devices (
 );
 CREATE INDEX IF NOT EXISTS gowa_devices_jid_idx ON gowa_devices (jid);
 CREATE INDEX IF NOT EXISTS gowa_devices_ad_jid_idx ON gowa_devices (ad_jid);
+ALTER TABLE gowa_devices ADD COLUMN IF NOT EXISTS proxy_url TEXT;
 `
 
 // NewPostgresDeviceRegistry creates the registry table if needed and wraps base.
@@ -75,13 +76,19 @@ func (r *PostgresDeviceRegistry) ImportFrom(src domainChatStorage.IChatStorageRe
 		if cfg == nil {
 			cfg = &domainChatStorage.DeviceWebhookConfig{}
 		}
+		var proxyURL *string
+		if proxies, ok := src.(domainChatStorage.IDeviceProxyStore); ok {
+			if proxyURL, err = proxies.GetDeviceProxy(rec.DeviceID); err != nil {
+				return 0, fmt.Errorf("proxy of %s: %w", rec.DeviceID, err)
+			}
+		}
 		if _, err := tx.Exec(`
 			INSERT INTO gowa_devices (device_id, display_name, jid, ad_jid, webhook_url, webhook_secret,
-				webhook_events, webhook_insecure_skip_verify, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+				webhook_events, webhook_insecure_skip_verify, created_at, updated_at, proxy_url)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 			ON CONFLICT (device_id) DO NOTHING
 		`, rec.DeviceID, rec.DisplayName, rec.JID, rec.ADJID, nonEmpty(cfg.WebhookURL), cfg.WebhookSecret,
-			cfg.WebhookEvents, cfg.WebhookInsecureSkipVerify, rec.CreatedAt, rec.UpdatedAt); err != nil {
+			cfg.WebhookEvents, cfg.WebhookInsecureSkipVerify, rec.CreatedAt, rec.UpdatedAt, nonEmpty(proxyURL)); err != nil {
 			return 0, fmt.Errorf("insert %s: %w", rec.DeviceID, err)
 		}
 	}
@@ -94,6 +101,51 @@ func (r *PostgresDeviceRegistry) ImportFrom(src domainChatStorage.IChatStorageRe
 		if err := src.DeleteDeviceRecord(rec.DeviceID); err != nil {
 			return len(records), fmt.Errorf("copied, but clearing %s from the old registry failed: %w", rec.DeviceID, err)
 		}
+	}
+	return len(records), nil
+}
+
+// ImportRecords adds the given records of src (another GOWA being consolidated into
+// this one) to a registry that may already hold devices. A device id already here is
+// refused: two slots must not claim one id. Webhooks and proxies travel with them.
+func (r *PostgresDeviceRegistry) ImportRecords(src domainChatStorage.IChatStorageRepository, records []*domainChatStorage.DeviceRecord) (int, error) {
+	for _, rec := range records {
+		if existing, err := r.GetDeviceRecord(rec.DeviceID); err != nil {
+			return 0, err
+		} else if existing != nil {
+			return 0, fmt.Errorf("device id %s already exists here", rec.DeviceID)
+		}
+	}
+	tx, err := r.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, rec := range records {
+		cfg, err := src.GetDeviceWebhookConfig(rec.DeviceID)
+		if err != nil {
+			return 0, fmt.Errorf("webhook of %s: %w", rec.DeviceID, err)
+		}
+		if cfg == nil {
+			cfg = &domainChatStorage.DeviceWebhookConfig{}
+		}
+		var proxyURL *string
+		if proxies, ok := src.(domainChatStorage.IDeviceProxyStore); ok {
+			if proxyURL, err = proxies.GetDeviceProxy(rec.DeviceID); err != nil {
+				return 0, fmt.Errorf("proxy of %s: %w", rec.DeviceID, err)
+			}
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO gowa_devices (device_id, display_name, jid, ad_jid, webhook_url, webhook_secret,
+				webhook_events, webhook_insecure_skip_verify, created_at, updated_at, proxy_url)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		`, rec.DeviceID, rec.DisplayName, rec.JID, rec.ADJID, nonEmpty(cfg.WebhookURL), cfg.WebhookSecret,
+			cfg.WebhookEvents, cfg.WebhookInsecureSkipVerify, rec.CreatedAt, rec.UpdatedAt, nonEmpty(proxyURL)); err != nil {
+			return 0, fmt.Errorf("insert %s: %w", rec.DeviceID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
 	}
 	return len(records), nil
 }
@@ -279,6 +331,28 @@ func (r *PostgresDeviceRegistry) GetDeviceWebhookConfig(deviceID string) (*domai
 		return nil, err
 	}
 	return &config, nil
+}
+
+// SetDeviceProxy sets (or, with nil, clears) the outbound proxy of one device.
+func (r *PostgresDeviceRegistry) SetDeviceProxy(deviceID string, proxyURL *string) error {
+	if strings.TrimSpace(deviceID) == "" {
+		return fmt.Errorf("device id is required")
+	}
+	result, err := r.db.Exec(`UPDATE gowa_devices SET proxy_url = $1, updated_at = $2 WHERE device_id = $3`, nonEmpty(proxyURL), time.Now(), deviceID)
+	return affectedOrNoRows(result, err)
+}
+
+// GetDeviceProxy returns the outbound proxy of one device, or nil when it has none.
+func (r *PostgresDeviceRegistry) GetDeviceProxy(deviceID string) (*string, error) {
+	var proxyURL sql.NullString
+	err := r.db.QueryRow(`SELECT proxy_url FROM gowa_devices WHERE device_id = $1`, deviceID).Scan(&proxyURL)
+	if err == sql.ErrNoRows || (err == nil && (!proxyURL.Valid || proxyURL.String == "")) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &proxyURL.String, nil
 }
 
 func affectedOrNoRows(result sql.Result, err error) error {

@@ -42,7 +42,55 @@ func MigrateSQLiteSessionsToPostgres(ctx context.Context, sqlitePath string, pg 
 		logrus.Warnf("[DB_MIGRATION] postgres already holds %d session(s); legacy %s left untouched", existing, sqlitePath)
 		return 0, nil
 	}
+	return copySQLiteStore(ctx, sqlitePath, pg, dbLog)
+}
 
+// ImportSQLiteSessions adds the devices of ANOTHER SQLite session store (for example
+// the one of a second GOWA that served a different proxy) to a Postgres store that
+// already has sessions. It refuses when any of those devices is already in Postgres —
+// one session must never be loaded by two stores. Same copy and rename as the
+// first-boot migration. The source GOWA must be stopped first.
+func ImportSQLiteSessions(ctx context.Context, sqlitePath string, pg *sql.DB, dbLog waLog.Logger) (int, error) {
+	if _, err := os.Stat(sqlitePath); err != nil {
+		return 0, err
+	}
+	uri := sqlite.FormatChatStorageURI("file:"+sqlitePath, true, true)
+	src, err := sql.Open(sqlite.DriverName, uri)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := src.QueryContext(ctx, `SELECT jid FROM whatsmeow_device`)
+	if err != nil {
+		src.Close()
+		return 0, err
+	}
+	var jids []string
+	for rows.Next() {
+		var jid string
+		if err := rows.Scan(&jid); err != nil {
+			rows.Close()
+			src.Close()
+			return 0, err
+		}
+		jids = append(jids, jid)
+	}
+	rows.Close()
+	src.Close()
+	for _, jid := range jids {
+		var found int
+		if err := pg.QueryRowContext(ctx, `SELECT COUNT(*) FROM whatsmeow_device WHERE jid = $1`, jid).Scan(&found); err != nil {
+			return 0, err
+		}
+		if found > 0 {
+			return 0, fmt.Errorf("device %s is already in postgres; refusing to load one session from two stores", jid)
+		}
+	}
+	return copySQLiteStore(ctx, sqlitePath, pg, dbLog)
+}
+
+// copySQLiteStore upgrades the SQLite store, copies every whatsmeow table into
+// Postgres in one transaction (foreign-key order) and renames the file.
+func copySQLiteStore(ctx context.Context, sqlitePath string, pg *sql.DB, dbLog waLog.Logger) (int, error) {
 	uri := sqlite.FormatChatStorageURI("file:"+sqlitePath, true, true)
 	legacy, err := sqlstore.New(ctx, sqlite.DriverName, uri, dbLog)
 	if err != nil {
