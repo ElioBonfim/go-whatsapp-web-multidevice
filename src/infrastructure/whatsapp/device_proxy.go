@@ -63,8 +63,14 @@ func (m *DeviceManager) SetDeviceProxy(deviceID string, proxyURL *string) error 
 			return err
 		}
 	}
+	before := m.deviceProxy(deviceID)
 	if err := store.SetDeviceProxy(deviceID, proxyURL); err != nil {
 		return err
+	}
+	// Same effective proxy: the client already dials through it, so a reconnect
+	// would only drop a live session.
+	if m.deviceProxy(deviceID) == before {
+		return nil
 	}
 
 	inst, ok := m.GetDevice(deviceID)
