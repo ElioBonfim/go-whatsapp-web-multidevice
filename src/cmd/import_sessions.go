@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
+	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/chatstorage"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/sqlite"
@@ -40,50 +41,75 @@ var importSessionsCmd = &cobra.Command{
 		defer pg.Close()
 		ctx := context.Background()
 
+		// Everything that can refuse is checked BEFORE the sessions move: a run that
+		// copies the sessions and then stops at the registry leaves a logged-in device
+		// with no webhook and no proxy.
+		var (
+			registry *chatstorage.PostgresDeviceRegistry
+			source   domainChatStorage.IChatStorageRepository
+			records  []*domainChatStorage.DeviceRecord
+			proxyURL *string
+		)
+		if importChatStoragePath != "" {
+			var ok bool
+			if registry, ok = chatStorageRepo.(*chatstorage.PostgresDeviceRegistry); !ok {
+				logrus.Fatal("import-sessions: the device registry is not in Postgres")
+			}
+			src, err := sql.Open(sqlite.DriverName, sqlite.FormatChatStorageURI("file:"+importChatStoragePath, true, true))
+			if err != nil {
+				logrus.Fatalf("open source chat storage: %v", err)
+			}
+			defer src.Close()
+			source = chatstorage.NewStorageRepository(src)
+			// An older release lacks newer columns (proxy_url); bring the copy up to date.
+			if err := source.InitializeSchema(); err != nil {
+				logrus.Fatalf("upgrade source chat storage: %v", err)
+			}
+			if records, err = source.ListDeviceRecords(); err != nil {
+				logrus.Fatalf("read source registry: %v", err)
+			}
+			for _, rec := range records {
+				if existing, err := registry.GetDeviceRecord(rec.DeviceID); err != nil {
+					logrus.Fatalf("check registry: %v", err)
+				} else if existing != nil {
+					logrus.Fatalf("device id %s already exists here; remove that slot first", rec.DeviceID)
+				}
+			}
+		}
+		if importProxyFile != "" {
+			if importChatStoragePath == "" {
+				logrus.Fatal("--proxy-file needs --chat-storage (the proxy is kept in the device registry)")
+			}
+			raw, err := os.ReadFile(importProxyFile)
+			if err != nil {
+				logrus.Fatalf("read proxy file: %v", err)
+			}
+			u := strings.TrimSpace(string(raw))
+			if err := whatsapp.ValidateProxyURL(u); err != nil {
+				logrus.Fatalf("proxy file: %v", err)
+			}
+			proxyURL = &u
+		}
+
 		devices, err := whatsapp.ImportSQLiteSessions(ctx, importSQLitePath, pg, waLog.Stdout("Database", config.WhatsappLogLevel, true))
 		if err != nil {
 			logrus.Fatalf("import sessions: %v", err)
 		}
 		logrus.Infof("[DB_IMPORT] %d device session(s) imported from %s", devices, importSQLitePath)
-
-		if importChatStoragePath == "" {
+		if registry == nil {
 			return
-		}
-		registry, ok := chatStorageRepo.(*chatstorage.PostgresDeviceRegistry)
-		if !ok {
-			logrus.Fatal("import-sessions: the device registry is not in Postgres")
-		}
-		src, err := sql.Open(sqlite.DriverName, sqlite.FormatChatStorageURI("file:"+importChatStoragePath, true, true))
-		if err != nil {
-			logrus.Fatalf("open source chat storage: %v", err)
-		}
-		defer src.Close()
-		source := chatstorage.NewStorageRepository(src)
-		records, err := source.ListDeviceRecords()
-		if err != nil {
-			logrus.Fatalf("read source registry: %v", err)
 		}
 		if _, err := registry.ImportRecords(source, records); err != nil {
 			logrus.Fatalf("import registry: %v", err)
 		}
-
-		if importProxyFile == "" {
-			return
-		}
-		raw, err := os.ReadFile(importProxyFile)
-		if err != nil {
-			logrus.Fatalf("read proxy file: %v", err)
-		}
-		proxyURL := strings.TrimSpace(string(raw))
-		if err := whatsapp.ValidateProxyURL(proxyURL); err != nil {
-			logrus.Fatalf("proxy file: %v", err)
-		}
-		for _, rec := range records {
-			if err := registry.SetDeviceProxy(rec.DeviceID, &proxyURL); err != nil {
-				logrus.Fatalf("set proxy of %s: %v", rec.DeviceID, err)
+		if proxyURL != nil {
+			for _, rec := range records {
+				if err := registry.SetDeviceProxy(rec.DeviceID, proxyURL); err != nil {
+					logrus.Fatalf("set proxy of %s: %v", rec.DeviceID, err)
+				}
 			}
 		}
-		logrus.Infof("[DB_IMPORT] %d device record(s) imported with their proxy", len(records))
+		logrus.Infof("[DB_IMPORT] %d device record(s) imported (proxy set: %t)", len(records), proxyURL != nil)
 	},
 }
 
