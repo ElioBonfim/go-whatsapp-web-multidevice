@@ -435,3 +435,20 @@ func (r *deviceChatStorage) SetDeviceWebhookConfig(deviceID string, config *doma
 func (r *deviceChatStorage) GetDeviceWebhookConfig(deviceID string) (*domainChatStorage.DeviceWebhookConfig, error) {
 	return r.base.GetDeviceWebhookConfig(deviceID)
 }
+
+// The device manager is built over a per-device wrapper (InitWaCLI), so the proxy of
+// each device must pass through it to the base registry, or no device ever gets its
+// own proxy. Unsupported base: no proxy to read, and setting one is refused.
+func (r *deviceChatStorage) GetDeviceProxy(deviceID string) (*string, error) {
+	if store, ok := r.base.(domainChatStorage.IDeviceProxyStore); ok {
+		return store.GetDeviceProxy(deviceID)
+	}
+	return nil, nil
+}
+
+func (r *deviceChatStorage) SetDeviceProxy(deviceID string, proxyURL *string) error {
+	if store, ok := r.base.(domainChatStorage.IDeviceProxyStore); ok {
+		return store.SetDeviceProxy(deviceID, proxyURL)
+	}
+	return ErrProxyNotSupported
+}
