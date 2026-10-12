@@ -660,10 +660,17 @@ func (service serviceMessage) DownloadMedia(ctx context.Context, request domainM
 		return response, fmt.Errorf("unsupported media type: %s", message.MediaType)
 	}
 
-	// Download the media using existing utils.ExtractMedia function
-	extractedMedia, err := utils.ExtractMedia(ctx, client, dateDir, downloadableMsg)
-	if err != nil {
-		return response, fmt.Errorf("failed to download media: %v", err)
+	// The same message reuses its file: a caller that asks again (a host
+	// re-syncing, a retry) must not leave one more copy on disk each time.
+	var extractedMedia utils.ExtractedMedia
+	if cached := cachedDownload(dateDir, request.MessageID, message.FileLength); cached != "" {
+		extractedMedia.MediaPath = cached
+	} else {
+		extractedMedia, err = utils.ExtractMedia(ctx, client, dateDir, downloadableMsg)
+		if err != nil {
+			return response, fmt.Errorf("failed to download media: %v", err)
+		}
+		extractedMedia.MediaPath = keepAsCached(extractedMedia.MediaPath, request.MessageID)
 	}
 
 	// Get file size
